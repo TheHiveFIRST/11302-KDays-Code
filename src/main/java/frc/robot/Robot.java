@@ -4,6 +4,7 @@
 
 package frc.robot;
 
+import edu.wpi.first.math.MathUtil;
 import edu.wpi.first.wpilibj.TimedRobot;
 import edu.wpi.first.wpilibj.XboxController;
 import edu.wpi.first.wpilibj2.command.Command;
@@ -24,18 +25,23 @@ import com.revrobotics.spark.config.SparkBaseConfig.IdleMode;
  * Everything lives in this one class on top of the existing swerve drivetrain:
  * intake, indexer, flywheel (shooter), turret, and hood.
  *
- * CONTROLLER MAP (single Xbox controller on port 0, driver sticks reserved for swerve):
+ * Two Xbox controllers: a DRIVER (port 0, sticks reserved for swerve) and an
+ * OPERATOR (port 1) who manually drives the turret and hood live off their sticks.
+ * Turret and hood are plain open-loop percent-output control - no PID, no setpoints.
+ * Whatever the stick says, the motor does, right now. Let go of the stick and it stops
+ * (idle mode brake holds position against gravity/friction, it just isn't "held" by PID).
+ *
+ * DRIVER CONTROLS (port 0):
  * A ................ Toggle shooter flywheel on/off (spins to target RPM, or spins down)
  * D-Pad Up .......... Increase flywheel target RPM
  * D-Pad Down ........ Decrease flywheel target RPM
- * D-Pad Left ........ Nudge turret left
- * D-Pad Right ....... Nudge turret right
- * Y ................. Nudge hood up
- * X ................. Nudge hood down
- * B ................. Reset turret + hood setpoints to home (0)
  * Left Bumper (hold). Run intake + indexer forward (intake a note)
  * Right Bumper (hold) Run intake + indexer in reverse (eject / unjam)
  * Right Trigger ..... Feed indexer into flywheel (shoot), analog threshold
+ *
+ * OPERATOR CONTROLS (port 1):
+ * Left Stick X ...... Turret left/right, proportional to stick deflection
+ * Right Stick Y ..... Hood up/down, proportional to stick deflection
  */
 public class Robot extends TimedRobot {
 
@@ -71,25 +77,23 @@ public class Robot extends TimedRobot {
 
     static final double kFlywheelRpmTolerance = 100.0; // "at speed" band for driver feedback / interlocks
 
-    // ---- Turret (position closed loop, using motor's own relative encoder, NOT absolute) ----
-    static final double kTurretP = 4.0;
-    static final double kTurretI = 0.0;
-    static final double kTurretD = 0.1;
-    static final double kTurretNudgeRotations = 0.02; // per button press, in motor rotations (pre-gear-ratio)
+    // ---- Turret (manual open-loop, driven directly by operator's left stick X) ----
+    static final double kTurretManualSpeed = 0.5; // max % power at full stick deflection
+    static final double kTurretDeadband = 0.1;
 
-    // ---- Hood (position closed loop, using motor's own relative encoder, NOT absolute) ----
-    static final double kHoodP = 4.0;
-    static final double kHoodI = 0.0;
-    static final double kHoodD = 0.1;
-    static final double kHoodNudgeRotations = 0.02;
+    // ---- Hood (manual open-loop, driven directly by operator's right stick Y) ----
+    static final double kHoodManualSpeed = 0.4; // max % power at full stick deflection
+    static final double kHoodDeadband = 0.1;
 
     static final int kDriverControllerPort = 0;
+    static final int kOperatorControllerPort = 1;
   }
 
   // ==================================================================================
   // HARDWARE
   // ==================================================================================
   private final XboxController driver = new XboxController(Constants.kDriverControllerPort);
+  private final XboxController operator = new XboxController(Constants.kOperatorControllerPort);
 
   private final SparkMax intakeMotor = new SparkMax(Constants.kIntakeCanId, MotorType.kBrushless);
   private final SparkMax indexerMotor = new SparkMax(Constants.kIndexerCanId, MotorType.kBrushless);
@@ -99,28 +103,19 @@ public class Robot extends TimedRobot {
   private final RelativeEncoder flywheelEncoder = flywheelLeader.getEncoder();
   private final SparkClosedLoopController flywheelController = flywheelLeader.getClosedLoopController();
 
+  // Turret and hood are plain percent-output motors now - no closed loop controller needed.
   private final SparkMax turretMotor = new SparkMax(Constants.kTurretCanId, MotorType.kBrushless);
-  private final RelativeEncoder turretEncoder = turretMotor.getEncoder();
-  private final SparkClosedLoopController turretController = turretMotor.getClosedLoopController();
-
   private final SparkMax hoodMotor = new SparkMax(Constants.kHoodCanId, MotorType.kBrushless);
-  private final RelativeEncoder hoodEncoder = hoodMotor.getEncoder();
-  private final SparkClosedLoopController hoodController = hoodMotor.getClosedLoopController();
 
   // ==================================================================================
   // STATE
   // ==================================================================================
   private boolean shooterEnabled = false;
   private double flywheelTargetRpm = Constants.kFlywheelDefaultTargetRpm;
-  private double turretSetpointRotations = 0.0;
-  private double hoodSetpointRotations = 0.0;
 
   // Used to detect rising edges (button just pressed this loop) since we aren't using
   // command-based Trigger bindings here.
   private boolean lastAButton = false;
-  private boolean lastBButton = false;
-  private boolean lastXButton = false;
-  private boolean lastYButton = false;
   private int lastPov = -1;
 
   private Command m_autonomousCommand;
@@ -171,11 +166,9 @@ public class Robot extends TimedRobot {
     if (m_autonomousCommand != null) {
       m_autonomousCommand.cancel();
     }
-    // Reset state each time teleop starts so we don't inherit stale setpoints from auto.
+    // Reset state each time teleop starts so we don't inherit a stale target from auto.
     shooterEnabled = false;
     flywheelTargetRpm = Constants.kFlywheelDefaultTargetRpm;
-    turretSetpointRotations = turretEncoder.getPosition();
-    hoodSetpointRotations = hoodEncoder.getPosition();
   }
 
   @Override
@@ -187,7 +180,7 @@ public class Robot extends TimedRobot {
 
     handleShooterToggle();
     handleFlywheelRpmAdjust();
-    handleTurretAndHood();
+    handleManualTurretAndHood();
     handleIntakeAndIndexer();
   }
 
@@ -236,29 +229,20 @@ public class Robot extends TimedRobot {
   }
 
   private void configureTurret() {
+    // Plain percent-output, brake so it doesn't drift once the stick is centered.
     SparkMaxConfig config = new SparkMaxConfig();
     config.idleMode(IdleMode.kBrake).inverted(false);
-    config.closedLoop
-        .feedbackSensor(FeedbackSensor.kPrimaryEncoder) // motor encoder, NOT an absolute encoder
-        .p(Constants.kTurretP)
-        .i(Constants.kTurretI)
-        .d(Constants.kTurretD)
-        .outputRange(-1.0, 1.0);
     turretMotor.configure(config, ResetMode.kResetSafeParameters, PersistMode.kPersistParameters);
-    // TODO: once you know the mechanical range of motion, add soft limits, e.g.:
+    // TODO: once you know the mechanical range of motion, consider adding soft limits
+    // off the built-in relative encoder so a stuck stick / runaway can't wind it up:
     // config.softLimit.forwardSoftLimit(...).forwardSoftLimitEnabled(true)
     //                  .reverseSoftLimit(...).reverseSoftLimitEnabled(true);
   }
 
   private void configureHood() {
+    // Plain percent-output, brake so it doesn't sag once the stick is centered.
     SparkMaxConfig config = new SparkMaxConfig();
     config.idleMode(IdleMode.kBrake).inverted(false);
-    config.closedLoop
-        .feedbackSensor(FeedbackSensor.kPrimaryEncoder) // motor encoder, NOT an absolute encoder
-        .p(Constants.kHoodP)
-        .i(Constants.kHoodI)
-        .d(Constants.kHoodD)
-        .outputRange(-1.0, 1.0);
     hoodMotor.configure(config, ResetMode.kResetSafeParameters, PersistMode.kPersistParameters);
     // TODO: same as turret - add soft limits once the mechanical range is known.
   }
@@ -299,42 +283,18 @@ public class Robot extends TimedRobot {
   }
 
   /**
-   * D-Pad Left/Right nudges the turret, Y/X nudge the hood, B re-homes both.
-   * Handled together since they share the POV-edge bookkeeping pattern.
+   * Operator's left stick X drives the turret, right stick Y drives the hood.
+   * Pure open-loop: whatever the stick reads (past deadband), that's the motor's
+   * percent output, scaled down so it doesn't slew wildly. No PID, no setpoint.
    */
-  private void handleTurretAndHood() {
-    int pov = driver.getPOV();
-    boolean povJustPressed = pov != -1 && pov != lastPov;
-    // NOTE: lastPov is updated in handleFlywheelRpmAdjust(); read again here before it changes.
-    if (povJustPressed) {
-      if (pov == 270) { // Left
-        turretSetpointRotations -= Constants.kTurretNudgeRotations;
-      } else if (pov == 90) { // Right
-        turretSetpointRotations += Constants.kTurretNudgeRotations;
-      }
-    }
+  private void handleManualTurretAndHood() {
+    double turretInput = MathUtil.applyDeadband(operator.getLeftX(), Constants.kTurretDeadband);
+    turretMotor.set(turretInput * Constants.kTurretManualSpeed);
 
-    boolean yButton = driver.getYButton();
-    if (yButton && !lastYButton) {
-      hoodSetpointRotations += Constants.kHoodNudgeRotations;
-    }
-    lastYButton = yButton;
-
-    boolean xButton = driver.getXButton();
-    if (xButton && !lastXButton) {
-      hoodSetpointRotations -= Constants.kHoodNudgeRotations;
-    }
-    lastXButton = xButton;
-
-    boolean bButton = driver.getBButton();
-    if (bButton && !lastBButton) {
-      turretSetpointRotations = 0.0;
-      hoodSetpointRotations = 0.0;
-    }
-    lastBButton = bButton;
-
-    turretController.setReference(turretSetpointRotations, ControlType.kPosition);
-    hoodController.setReference(hoodSetpointRotations, ControlType.kPosition);
+    // Right stick Y is typically positive when pushed down, so invert it to make
+    // "stick up" mean "hood up".
+    double hoodInput = MathUtil.applyDeadband(-operator.getRightY(), Constants.kHoodDeadband);
+    hoodMotor.set(hoodInput * Constants.kHoodManualSpeed);
   }
 
   /**
